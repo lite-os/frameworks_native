@@ -30,6 +30,7 @@
 
 #include <EGL/egl.h>
 
+#include <bfqio/bfqio.h>
 #include <cutils/properties.h>
 #include <log/log.h>
 
@@ -98,6 +99,20 @@
 #define DEBUG_SCREENSHOTS   false
 
 extern "C" EGLAPI const char* eglQueryStringImplementationANDROID(EGLDisplay dpy, EGLint name);
+
+static int convertRotation(android::Transform::orientation_flags rotation)
+{
+    switch (rotation) {
+        case android::Transform::ROT_90:
+            return 1;
+        case android::Transform::ROT_180:
+            return 2;
+        case android::Transform::ROT_270:
+            return 3;
+        default:
+            return 0;
+    }
+}
 
 namespace android {
 
@@ -242,6 +257,10 @@ SurfaceFlinger::SurfaceFlinger()
     property_get("ro.sf.disable_triple_buffer", value, "1");
     mLayerTripleBufferingDisabled = atoi(value);
     ALOGI_IF(mLayerTripleBufferingDisabled, "Disabling Triple Buffering");
+
+    // we store the value as orientation:
+    // 90 -> 1, 180 -> 2, 270 -> 3
+    mHardwareRotation = property_get_int32("ro.sf.hwrotation", 0) / 90;
 
     // We should be reading 'persist.sys.sf.color_saturation' here
     // but since /data may be encrypted, we need to wait until after vold
@@ -628,6 +647,7 @@ void SurfaceFlinger::init() {
 
     mEventControlThread = new EventControlThread(this);
     mEventControlThread->run("EventControl", PRIORITY_URGENT_DISPLAY);
+    android_set_rt_ioprio(mEventControlThread->getTid(), 1);
 
     // initialize our drawing state
     mDrawingState = mCurrentState;
@@ -793,10 +813,19 @@ status_t SurfaceFlinger::getDisplayConfigs(const sp<IBinder>& display,
             info.orientation = 0;
         }
 
-        info.w = hwConfig->getWidth();
-        info.h = hwConfig->getHeight();
-        info.xdpi = xdpi;
-        info.ydpi = ydpi;
+        if ((type == DisplayDevice::DISPLAY_PRIMARY) &&
+                (mHardwareRotation & DisplayState::eOrientationSwapMask)) {
+            info.h = hwConfig->getWidth();
+            info.w = hwConfig->getHeight();
+            info.xdpi = ydpi;
+            info.ydpi = xdpi;
+        }
+        else {
+            info.w = hwConfig->getWidth();
+            info.h = hwConfig->getHeight();
+            info.xdpi = xdpi;
+            info.ydpi = ydpi;
+        }
         info.fps = 1e9 / hwConfig->getVsyncPeriod();
         info.appVsyncOffset = vsyncPhaseOffsetNs;
 
@@ -1305,6 +1334,7 @@ void SurfaceFlinger::onHotplugReceived(int32_t sequenceId,
             createBuiltinDisplayLocked(DisplayDevice::DISPLAY_PRIMARY);
         }
         createDefaultDisplayDevice();
+        property_set("service.sf.primary_display_ready", "1");
     } else {
         if (sequenceId != mComposerSequenceId) {
             return;
@@ -1728,6 +1758,7 @@ void SurfaceFlinger::rebuildLayerStacks() {
             Region opaqueRegion;
             Region dirtyRegion;
             Vector<sp<Layer>> layersSortedByZ;
+            Vector<sp<Layer>> layersNeedingFences;
             const sp<DisplayDevice>& displayDevice(mDisplays[dpy]);
             const Transform& tr(displayDevice->getTransform());
             const Rect bounds(displayDevice->getBounds());
@@ -1735,6 +1766,7 @@ void SurfaceFlinger::rebuildLayerStacks() {
                 computeVisibleRegions(displayDevice, dirtyRegion, opaqueRegion);
 
                 mDrawingState.traverseInZOrder([&](Layer* layer) {
+                    bool hwcLayerDestroyed = false;
                     if (layer->belongsToDisplay(displayDevice->getLayerStack(),
                                 displayDevice->isPrimary())) {
                         Region drawRegion(tr.transform(
@@ -1745,6 +1777,8 @@ void SurfaceFlinger::rebuildLayerStacks() {
                         } else {
                             // Clear out the HWC layer if this layer was
                             // previously visible, but no longer is
+                            hwcLayerDestroyed = layer->hasHwcLayer(
+                                    displayDevice->getHwcDisplayId());
                             layer->destroyHwcLayer(
                                     displayDevice->getHwcDisplayId());
                         }
@@ -1752,11 +1786,25 @@ void SurfaceFlinger::rebuildLayerStacks() {
                         // WM changes displayDevice->layerStack upon sleep/awake.
                         // Here we make sure we delete the HWC layers even if
                         // WM changed their layer stack.
+                        hwcLayerDestroyed = layer->hasHwcLayer(displayDevice->getHwcDisplayId());
                         layer->destroyHwcLayer(displayDevice->getHwcDisplayId());
+                    }
+
+                    // If a layer is not going to get a release fence because
+                    // it is invisible, but it is also going to release its
+                    // old buffer, add it to the list of layers needing
+                    // fences.
+                    if (hwcLayerDestroyed) {
+                        auto found = std::find(mLayersWithQueuedFrames.cbegin(),
+                                mLayersWithQueuedFrames.cend(), layer);
+                        if (found != mLayersWithQueuedFrames.cend()) {
+                            layersNeedingFences.add(layer);
+                        }
                     }
                 });
             }
             displayDevice->setVisibleLayersSortedByZ(layersSortedByZ);
+            displayDevice->setLayersNeedingFences(layersNeedingFences);
             displayDevice->undefinedRegion.set(bounds);
             displayDevice->undefinedRegion.subtractSelf(
                     tr.transform(opaqueRegion));
@@ -1978,15 +2026,35 @@ void SurfaceFlinger::postFramebuffer()
         displayDevice->onSwapBuffersCompleted();
         displayDevice->makeCurrent(mEGLDisplay, mEGLContext);
         for (auto& layer : displayDevice->getVisibleLayersSortedByZ()) {
-            sp<Fence> releaseFence = Fence::NO_FENCE;
+            // The layer buffer from the previous frame (if any) is released
+            // by HWC only when the release fence from this frame (if any) is
+            // signaled.  Always get the release fence from HWC first.
+            auto hwcLayer = layer->getHwcLayer(hwcId);
+            sp<Fence> releaseFence = mHwc->getLayerReleaseFence(hwcId, hwcLayer);
+
+            // If the layer was client composited in the previous frame, we
+            // need to merge with the previous client target acquire fence.
+            // Since we do not track that, always merge with the current
+            // client target acquire fence when it is available, even though
+            // this is suboptimal.
             if (layer->getCompositionType(hwcId) == HWC2::Composition::Client) {
-                releaseFence = displayDevice->getClientTargetAcquireFence();
-            } else {
-                auto hwcLayer = layer->getHwcLayer(hwcId);
-                releaseFence = mHwc->getLayerReleaseFence(hwcId, hwcLayer);
+                releaseFence = Fence::merge("LayerRelease", releaseFence,
+                        displayDevice->getClientTargetAcquireFence());
             }
+
             layer->onLayerDisplayed(releaseFence);
         }
+
+        // We've got a list of layers needing fences, that are disjoint with
+        // displayDevice->getVisibleLayersSortedByZ.  The best we can do is to
+        // supply them with the present fence.
+        if (!displayDevice->getLayersNeedingFences().isEmpty()) {
+            sp<Fence> presentFence = mHwc->getPresentFence(hwcId);
+            for (auto& layer : displayDevice->getLayersNeedingFences()) {
+                layer->onLayerDisplayed(presentFence);
+            }
+        }
+
         if (hwcId >= 0) {
             mHwc->clearReleaseFences(hwcId);
         }
@@ -2255,7 +2323,7 @@ void SurfaceFlinger::handleTransactionLocked(uint32_t transactionFlags)
                     sp<const DisplayDevice> hw(mDisplays[dpy]);
                     if (layer->belongsToDisplay(hw->getLayerStack(), hw->isPrimary())) {
                         if (disp == NULL) {
-                            disp = hw;
+                            disp = std::move(hw);
                         } else {
                             disp = NULL;
                             break;
@@ -4152,14 +4220,27 @@ void SurfaceFlinger::repaintEverything() {
 // Checks that the requested width and height are valid and updates them to the display dimensions
 // if they are set to 0
 static status_t updateDimensionsLocked(const sp<const DisplayDevice>& displayDevice,
-                                       Transform::orientation_flags rotation,
+                                       Transform::orientation_flags* rotation,
+                                       int32_t hardwareRotation,
                                        uint32_t* requestedWidth, uint32_t* requestedHeight) {
     // get screen geometry
     uint32_t displayWidth = displayDevice->getWidth();
     uint32_t displayHeight = displayDevice->getHeight();
 
-    if (rotation & Transform::ROT_90) {
-        std::swap(displayWidth, displayHeight);
+    switch ((convertRotation(*rotation) + hardwareRotation) % 4) {
+        case 1:
+            std::swap(displayWidth, displayHeight);
+            *rotation = Transform::ROT_90;
+            break;
+        case 2:
+            *rotation = Transform::ROT_180;
+            break;
+        case 3:
+            std::swap(displayWidth, displayHeight);
+            *rotation = Transform::ROT_270;
+            break;
+        default:
+            break;
     }
 
     if ((*requestedWidth > displayWidth) || (*requestedHeight > displayHeight)) {
@@ -4267,7 +4348,8 @@ status_t SurfaceFlinger::captureScreen(const sp<IBinder>& display,
     { // Autolock scope
         Mutex::Autolock lock(mStateLock);
         sp<const DisplayDevice> displayDevice(getDisplayDeviceLocked(display));
-        updateDimensionsLocked(displayDevice, rotationFlags, &reqWidth, &reqHeight);
+        updateDimensionsLocked(displayDevice, &rotationFlags, mHardwareRotation,
+                &reqWidth, &reqHeight);
     }
 
     // create a surface (because we're a producer, and we need to
@@ -4369,8 +4451,6 @@ void SurfaceFlinger::renderScreenImplLocked(
     // get screen geometry
     const int32_t hw_w = hw->getWidth();
     const int32_t hw_h = hw->getHeight();
-    const bool filtering = static_cast<int32_t>(reqWidth) != hw_w ||
-                           static_cast<int32_t>(reqHeight) != hw_h;
 
     // if a default or invalid sourceCrop is passed in, set reasonable values
     if (sourceCrop.width() == 0 || sourceCrop.height() == 0 ||
@@ -4378,6 +4458,9 @@ void SurfaceFlinger::renderScreenImplLocked(
         sourceCrop.setLeftTop(Point(0, 0));
         sourceCrop.setRightBottom(Point(hw_w, hw_h));
     }
+
+    const bool filtering = static_cast<int32_t>(reqWidth) != sourceCrop.width() ||
+            static_cast<int32_t>(reqHeight) != sourceCrop.height();
 
     // ensure that sourceCrop is inside screen
     if (sourceCrop.left < 0) {

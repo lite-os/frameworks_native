@@ -124,6 +124,8 @@ public:
 
     void                    setVisibleLayersSortedByZ(const Vector< sp<Layer> >& layers);
     const Vector< sp<Layer> >& getVisibleLayersSortedByZ() const;
+    void                    setLayersNeedingFences(const Vector< sp<Layer> >& layers);
+    const Vector< sp<Layer> >& getLayersNeedingFences() const;
     Region                  getDirtyRegion(bool repaintEverything) const;
 
     void                    setLayerStack(uint32_t stack);
@@ -241,11 +243,13 @@ private:
 
     // list of visible layers on that display
     Vector< sp<Layer> > mVisibleLayersSortedByZ;
+    // list of layers needing fences
+    Vector< sp<Layer> > mLayersNeedingFences;
 
     /*
      * Transaction state
      */
-    static status_t orientationToTransfrom(int orientation,
+    status_t orientationToTransfrom(int orientation,
             int w, int h, Transform* tr);
 
     // The identifier of the active layer stack for this display. Several displays
@@ -267,6 +271,8 @@ private:
     int mPowerMode;
     // Current active config
     int mActiveConfig;
+    // Panel hardware rotation
+    int32_t mHardwareRotation;
 #ifdef USE_HWC2
     // current active color mode
     android_color_mode_t mActiveColorMode;

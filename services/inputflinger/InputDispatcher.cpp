@@ -20,28 +20,28 @@
 //#define LOG_NDEBUG 0
 
 // Log detailed debug messages about each inbound event notification to the dispatcher.
-#define DEBUG_INBOUND_EVENT_DETAILS 0
+// #define DEBUG_INBOUND_EVENT_DETAILS 0
 
 // Log detailed debug messages about each outbound event processed by the dispatcher.
-#define DEBUG_OUTBOUND_EVENT_DETAILS 0
+// #define DEBUG_OUTBOUND_EVENT_DETAILS 0
 
 // Log debug messages about the dispatch cycle.
-#define DEBUG_DISPATCH_CYCLE 0
+// #define DEBUG_DISPATCH_CYCLE 0
 
 // Log debug messages about registrations.
-#define DEBUG_REGISTRATION 0
+// #define DEBUG_REGISTRATION 0
 
 // Log debug messages about input event injection.
-#define DEBUG_INJECTION 0
+// #define DEBUG_INJECTION 0
 
 // Log debug messages about input focus tracking.
-#define DEBUG_FOCUS 0
+// #define DEBUG_FOCUS 0
 
 // Log debug messages about the app switch latency optimization.
-#define DEBUG_APP_SWITCH 0
+// #define DEBUG_APP_SWITCH 0
 
 // Log debug messages about hover events.
-#define DEBUG_HOVER 0
+// #define DEBUG_HOVER 0
 
 #include "InputDispatcher.h"
 
@@ -1994,10 +1994,10 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
             const PointerCoords* usingCoords = motionEntry->pointerCoords;
 
             // Set the X and Y offset depending on the input source.
-            float xOffset, yOffset, scaleFactor;
+            float xOffset, yOffset;
             if ((motionEntry->source & AINPUT_SOURCE_CLASS_POINTER)
                     && !(dispatchEntry->targetFlags & InputTarget::FLAG_ZERO_COORDS)) {
-                scaleFactor = dispatchEntry->scaleFactor;
+                float scaleFactor = dispatchEntry->scaleFactor;
                 xOffset = dispatchEntry->xOffset * scaleFactor;
                 yOffset = dispatchEntry->yOffset * scaleFactor;
                 if (scaleFactor != 1.0f) {
@@ -2010,7 +2010,6 @@ void InputDispatcher::startDispatchCycleLocked(nsecs_t currentTime,
             } else {
                 xOffset = 0.0f;
                 yOffset = 0.0f;
-                scaleFactor = 1.0f;
 
                 // We don't want the dispatch target to know.
                 if (dispatchEntry->targetFlags & InputTarget::FLAG_ZERO_COORDS) {
